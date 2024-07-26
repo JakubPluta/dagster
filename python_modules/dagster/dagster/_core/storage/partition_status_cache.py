@@ -259,9 +259,19 @@ def _build_status_cache(
         instance, asset_key, asset_record
     )
 
+    last_materialization_failure_storage_id = (
+        asset_record.asset_entry.last_materialization_failure_storage_id
+        if (
+            asset_record
+            and instance.event_log_storage.asset_records_have_planned_and_failed_materializations
+        )
+        else 0
+    )
+
     latest_storage_id = max(
         last_materialization_storage_id or 0,
         last_planned_materialization_storage_id or 0,
+        last_materialization_failure_storage_id or 0,
     )
     if not latest_storage_id:
         return None
@@ -284,6 +294,8 @@ def _build_status_cache(
         if stored_cache_value
         else None
     )
+
+    cached_latest_storage_id = stored_cache_value.latest_storage_id if stored_cache_value else None
 
     if stored_cache_value:
         # fetch the incremental new materialized partitions, and update the cached materialized
@@ -326,19 +338,37 @@ def _build_status_cache(
             )
         )
 
-    (
-        failed_subset,
-        in_progress_subset,
-        earliest_in_progress_materialization_event_id,
-    ) = build_failed_and_in_progress_partition_subset(
-        instance,
-        asset_key,
-        partitions_def,
-        dynamic_partitions_store,
-        last_planned_materialization_storage_id=last_planned_materialization_storage_id,
-        failed_subset=failed_subset,
-        after_storage_id=cached_in_progress_cursor,
-    )
+    # If we are tracking ASSET_MATERIALIZATION_FAILURE events on the AssetRecord, the storage ID
+    # will increase whenever some event has come in that might affect the failed and in progress
+    # subset (because only ASSET_MATERIALIZATION_PLANNED, ASSET_MATERIALIZATION,
+    # or ASSET_MATERIALIZATION_FAILURE events will affect the storage ID, and one of those events
+    # will occur whenever the cache needs to be updated.
+    if (
+        not instance.event_log_storage.asset_records_have_planned_and_failed_materializations
+        or not cached_latest_storage_id
+        or (latest_storage_id > cached_latest_storage_id)
+    ):
+        (
+            failed_subset,
+            in_progress_subset,
+            earliest_in_progress_materialization_event_id,
+        ) = build_failed_and_in_progress_partition_subset(
+            instance,
+            asset_key,
+            partitions_def,
+            dynamic_partitions_store,
+            last_planned_materialization_storage_id=last_planned_materialization_storage_id,
+            failed_subset=failed_subset,
+            after_storage_id=cached_in_progress_cursor,
+        )
+    else:
+        failed_subset = failed_subset or partitions_def.empty_subset()
+        in_progress_subset = (
+            partitions_def.deserialize_subset(stored_cache_value.serialized_failed_partition_subset)
+            if stored_cache_value and stored_cache_value.serialized_failed_partition_subset
+            else partitions_def.empty_subset()
+        )
+        earliest_in_progress_materialization_event_id = cached_in_progress_cursor
 
     return AssetStatusCacheValue(
         latest_storage_id=latest_storage_id,
@@ -380,7 +410,7 @@ def build_failed_and_in_progress_partition_subset(
 
     cursor = None
     if incomplete_materialization_records:
-        to_fetch = list(
+        runs_to_fetch = list(
             set(
                 [
                     check.not_none(record.last_planned_materialization_run_id)
@@ -388,12 +418,21 @@ def build_failed_and_in_progress_partition_subset(
                 ]
             )
         )
+
+        # incorporate failure records that might have come in before the run finished
+        if instance.event_log_storage.asset_records_have_planned_and_failed_materializations:
+            for partition, record in incomplete_materialization_records.items():
+                run_id = check.not_none(record.last_planned_materialization_run_id)
+                if record.last_materialization_failure_run_id == run_id:
+                    failed_partitions.add(partition)
+                    runs_to_fetch.remove(run_id)
+
         finished_runs = {}
         unfinished_runs = {}
 
-        while to_fetch:
-            chunk = to_fetch[:RUN_FETCH_BATCH_SIZE]
-            to_fetch = to_fetch[RUN_FETCH_BATCH_SIZE:]
+        while runs_to_fetch:
+            chunk = runs_to_fetch[:RUN_FETCH_BATCH_SIZE]
+            runs_to_fetch = runs_to_fetch[RUN_FETCH_BATCH_SIZE:]
             for r in instance.get_runs(filters=RunsFilter(run_ids=chunk)):
                 if r.status in FINISHED_STATUSES:
                     finished_runs[r.run_id] = r.status
