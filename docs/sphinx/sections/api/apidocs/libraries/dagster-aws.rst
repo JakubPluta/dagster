@@ -119,6 +119,7 @@ Clients
 .. autoclass:: dagster_aws.pipes.PipesLambdaClient
 
 .. autoclass:: dagster_aws.pipes.PipesGlueClient
+   :noindex:
    :members: run
 
 Legacy
