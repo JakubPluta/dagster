@@ -90,6 +90,28 @@ def fetch_asset_condition_evaluation_record_for_partition(
     )
 
 
+def fetch_true_partitions_for_evaluation_node(
+    graphene_info: "ResolveInfo",
+    graphene_asset_key: GrapheneAssetKeyInput,
+    evaluation_id: int,
+    node_unique_id: str,
+) -> Sequence[str]:
+    asset_key = AssetKey.from_graphql_input(graphene_asset_key)
+    schedule_storage = check.not_none(graphene_info.context.instance.schedule_storage)
+    record = next(
+        iter(
+            schedule_storage.get_auto_materialize_asset_evaluations(
+                asset_key, cursor=evaluation_id + 1, limit=1
+            )
+        )
+    )
+    root_evaluation = record.get_evaluation_with_run_ids(None).evaluation
+    for evaluation in root_evaluation.iter_nodes():
+        if evaluation.condition_snapshot.unique_id == node_unique_id:
+            return list(evaluation.true_subset.subset_value.get_partition_keys())
+    check.failed("No matching unique id found")
+
+
 def fetch_asset_condition_evaluation_records_for_asset_key(
     graphene_info: "ResolveInfo",
     graphene_asset_key: GrapheneAssetKeyInput,
